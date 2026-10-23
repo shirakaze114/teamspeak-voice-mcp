@@ -7,7 +7,10 @@ use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::*;
 use rmcp::service::{RequestContext, SubscriptionContext};
-use rmcp::{ErrorData as McpError, Peer, RoleServer, ServerHandler, schemars, tool, tool_handler, tool_router};
+use rmcp::{
+    ErrorData as McpError, Peer, RoleServer, ServerHandler, schemars, tool, tool_handler,
+    tool_router,
+};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::broadcast::error::RecvError;
@@ -24,6 +27,7 @@ const URI_EVENT_PREFIX: &str = "ts://transcripts/";
 #[derive(Clone)]
 pub struct VoiceMcp {
     app: Arc<App>,
+    #[allow(dead_code)] // consumed by the #[tool_handler] macro
     tool_router: ToolRouter<VoiceMcp>,
     /// Legacy `resources/subscribe` URIs of this session.
     subscribed: Arc<Mutex<HashSet<String>>>,
@@ -55,13 +59,18 @@ fn caller(ctx: &RequestContext<RoleServer>) -> Option<Caller> {
 fn require(ctx: &RequestContext<RoleServer>, scope: Scope) -> Result<(), McpError> {
     match caller(ctx) {
         Some(c) if c.has(scope) => Ok(()),
-        _ => Err(McpError::invalid_request(format!("token lacks '{scope:?}' scope"), None)),
+        _ => Err(McpError::invalid_request(
+            format!("token lacks '{scope:?}' scope"),
+            None,
+        )),
     }
 }
 
 fn json_result(v: impl serde::Serialize) -> Result<CallToolResult, McpError> {
     let v = serde_json::to_value(v).map_err(|e| McpError::internal_error(e.to_string(), None))?;
-    Ok(CallToolResult::success(vec![ContentBlock::text(serde_json::to_string_pretty(&v).unwrap_or_default())]))
+    Ok(CallToolResult::success(vec![ContentBlock::text(
+        serde_json::to_string_pretty(&v).unwrap_or_default(),
+    )]))
 }
 
 fn internal(e: anyhow::Error) -> McpError {
@@ -80,18 +89,26 @@ impl VoiceMcp {
     }
 
     #[tool(description = "List the users in the bot's current TeamSpeak channel.")]
-    async fn ts_list_users(&self, ctx: RequestContext<RoleServer>) -> Result<CallToolResult, McpError> {
+    async fn ts_list_users(
+        &self,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
         require(&ctx, Scope::Read)?;
         json_result(self.app.ts.list_users().await.map_err(internal)?)
     }
 
     #[tool(description = "Get bot status: connection, channel, playback, ASR mode and usage.")]
-    async fn ts_get_status(&self, ctx: RequestContext<RoleServer>) -> Result<CallToolResult, McpError> {
+    async fn ts_get_status(
+        &self,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
         require(&ctx, Scope::Read)?;
         json_result(self.app.status().await)
     }
 
-    #[tool(description = "Get final voice transcripts, oldest first. Use `after_seq` with the last seen `seq` to poll for new ones.")]
+    #[tool(
+        description = "Get final voice transcripts, oldest first. Use `after_seq` with the last seen `seq` to poll for new ones."
+    )]
     async fn ts_get_transcripts(
         &self,
         Parameters(q): Parameters<Query>,
@@ -102,7 +119,9 @@ impl VoiceMcp {
         json_result(json!({ "events": events, "latest_seq": self.app.store.latest_seq() }))
     }
 
-    #[tool(description = "Speak text in the TeamSpeak channel via TTS. Requests are queued; set interrupt=true to cut off current speech.")]
+    #[tool(
+        description = "Speak text in the TeamSpeak channel via TTS. Requests are queued; set interrupt=true to cut off current speech."
+    )]
     async fn ts_speak(
         &self,
         Parameters(a): Parameters<SpeakArgs>,
@@ -114,7 +133,10 @@ impl VoiceMcp {
     }
 
     #[tool(description = "Stop the current voice playback and clear queued speech.")]
-    async fn ts_stop_speaking(&self, ctx: RequestContext<RoleServer>) -> Result<CallToolResult, McpError> {
+    async fn ts_stop_speaking(
+        &self,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
         require(&ctx, Scope::Speak)?;
         self.app.tts.stop().await.map_err(internal)?;
         json_result(json!({ "stopped": true }))
@@ -128,9 +150,16 @@ impl VoiceMcp {
     ) -> Result<CallToolResult, McpError> {
         require(&ctx, Scope::Speak)?;
         if a.text.trim().is_empty() || a.text.len() > 1024 {
-            return Err(McpError::invalid_params("text must be 1..=1024 bytes", None));
+            return Err(McpError::invalid_params(
+                "text must be 1..=1024 bytes",
+                None,
+            ));
         }
-        self.app.ts.send_channel_message(a.text).await.map_err(internal)?;
+        self.app
+            .ts
+            .send_channel_message(a.text)
+            .await
+            .map_err(internal)?;
         json_result(json!({ "sent": true }))
     }
 }
@@ -147,7 +176,10 @@ impl VoiceMcp {
 
     /// Forward store events as `notifications/resources/updated` (legacy subscribe).
     fn start_forwarder(&self, peer: Peer<RoleServer>) {
-        if self.forwarder_started.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        if self
+            .forwarder_started
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
             return;
         }
         let mut rx = self.app.store.live.subscribe();
@@ -160,10 +192,18 @@ impl VoiceMcp {
                     Err(RecvError::Closed) => return,
                 };
                 for uri in Self::uris_for(&ev) {
-                    if !subscribed.lock().unwrap().contains(*uri) {
+                    if !subscribed
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .contains(*uri)
+                    {
                         continue;
                     }
-                    if peer.notify_resource_updated(ResourceUpdatedNotificationParam::new(*uri)).await.is_err() {
+                    if peer
+                        .notify_resource_updated(ResourceUpdatedNotificationParam::new(*uri))
+                        .await
+                        .is_err()
+                    {
                         return;
                     }
                 }
@@ -172,7 +212,9 @@ impl VoiceMcp {
     }
 
     fn resource(uri: &str, name: &str, desc: &str) -> Resource {
-        Resource::new(uri, name).with_description(desc).with_mime_type("application/json")
+        Resource::new(uri, name)
+            .with_description(desc)
+            .with_mime_type("application/json")
     }
 }
 
@@ -180,7 +222,11 @@ impl VoiceMcp {
 impl ServerHandler for VoiceMcp {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(
-            ServerCapabilities::builder().enable_tools().enable_resources().enable_resources_subscribe().build(),
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .enable_resources_subscribe()
+                .build(),
         )
         .with_server_info(Implementation::from_build_env())
         .with_instructions(
@@ -198,9 +244,17 @@ impl ServerHandler for VoiceMcp {
         require(&ctx, Scope::Read)?;
         Ok(ListResourcesResult {
             resources: vec![
-                Self::resource(URI_LATEST, "latest-transcripts", "The 50 most recent final transcripts. Updated on every new utterance."),
+                Self::resource(
+                    URI_LATEST,
+                    "latest-transcripts",
+                    "The 50 most recent final transcripts. Updated on every new utterance.",
+                ),
                 Self::resource(URI_USERS, "channel-users", "Users in the bot's channel."),
-                Self::resource(URI_STATUS, "bot-status", "Connection, playback, ASR and usage status."),
+                Self::resource(
+                    URI_STATUS,
+                    "bot-status",
+                    "Connection, playback, ASR and usage status.",
+                ),
             ],
             ..Default::default()
         })
@@ -215,7 +269,9 @@ impl ServerHandler for VoiceMcp {
         Ok(ListResourceTemplatesResult {
             resource_templates: vec![
                 ResourceTemplate::new("ts://transcripts/{event_id}", "transcript-event")
-                    .with_description("A single transcript event by event_id, e.g. ts://transcripts/evt_12")
+                    .with_description(
+                        "A single transcript event by event_id, e.g. ts://transcripts/evt_12",
+                    )
                     .with_mime_type("application/json"),
             ],
             ..Default::default()
@@ -234,41 +290,75 @@ impl ServerHandler for VoiceMcp {
                 "events": self.app.store.query(&Query { limit: 50, ..Default::default() }),
                 "latest_seq": self.app.store.latest_seq(),
             }),
-            URI_USERS => serde_json::to_value(self.app.ts.list_users().await.map_err(internal)?).unwrap_or_default(),
+            URI_USERS => serde_json::to_value(self.app.ts.list_users().await.map_err(internal)?)
+                .unwrap_or_default(),
             URI_STATUS => serde_json::to_value(self.app.status().await).unwrap_or_default(),
-            _ => match uri.strip_prefix(URI_EVENT_PREFIX).and_then(|id| self.app.store.get(id)) {
+            _ => match uri
+                .strip_prefix(URI_EVENT_PREFIX)
+                .and_then(|id| self.app.store.get(id))
+            {
                 Some(ev) => serde_json::to_value(ev).unwrap_or_default(),
-                None => return Err(McpError::resource_not_found("resource_not_found", Some(json!({ "uri": uri })))),
+                None => {
+                    return Err(McpError::resource_not_found(
+                        "resource_not_found",
+                        Some(json!({ "uri": uri })),
+                    ));
+                }
             },
         };
         let text = serde_json::to_string_pretty(&value).unwrap_or_default();
-        Ok(ReadResourceResult::new(vec![ResourceContents::text(text, uri)]).into())
+        Ok(ReadResourceResult::new(vec![
+            ResourceContents::text(text, uri).with_mime_type("application/json"),
+        ])
+        .into())
     }
 
     #[allow(deprecated)]
-    async fn subscribe(&self, r: SubscribeRequestParams, ctx: RequestContext<RoleServer>) -> Result<(), McpError> {
+    async fn subscribe(
+        &self,
+        r: SubscribeRequestParams,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
         require(&ctx, Scope::Read)?;
-        self.subscribed.lock().unwrap().insert(r.uri);
+        self.subscribed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(r.uri);
         self.start_forwarder(ctx.peer.clone());
         Ok(())
     }
 
     #[allow(deprecated)]
-    async fn unsubscribe(&self, r: UnsubscribeRequestParams, ctx: RequestContext<RoleServer>) -> Result<(), McpError> {
+    async fn unsubscribe(
+        &self,
+        r: UnsubscribeRequestParams,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
         require(&ctx, Scope::Read)?;
-        self.subscribed.lock().unwrap().remove(&r.uri);
+        self.subscribed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&r.uri);
         Ok(())
     }
 
     /// 2026-07-28 `subscriptions/listen`.
-    fn accepted_subscription_filter(&self, requested: &SubscriptionFilter) -> Option<SubscriptionFilter> {
+    fn accepted_subscription_filter(
+        &self,
+        requested: &SubscriptionFilter,
+    ) -> Option<SubscriptionFilter> {
         Some(requested.supported_by(&self.get_info().capabilities))
     }
 
     async fn listen(&self, context: SubscriptionContext) -> Result<(), McpError> {
         require(context.request_context(), Scope::Read)?;
-        let accepted: HashSet<String> =
-            context.accepted().resource_subscriptions.clone().unwrap_or_default().into_iter().collect();
+        let accepted: HashSet<String> = context
+            .accepted()
+            .resource_subscriptions
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
         let mut rx = self.app.store.live.subscribe();
         loop {
             tokio::select! {

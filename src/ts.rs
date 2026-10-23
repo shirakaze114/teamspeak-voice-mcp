@@ -12,15 +12,13 @@ use anyhow::{Context, Result};
 use futures::StreamExt;
 use time::OffsetDateTime;
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio::time::{MissedTickBehavior, interval, sleep, timeout};
+use tokio::time::{MissedTickBehavior, interval, sleep};
 use tracing::{debug, error, info, warn};
 
 use tsclientlib::audio::AudioHandler;
 use tsclientlib::events::Event;
 use tsclientlib::prelude::*;
-use tsclientlib::{
-    ClientId, Connection, DisconnectOptions, Identity, MessageTarget, StreamItem,
-};
+use tsclientlib::{ClientId, Connection, DisconnectOptions, Identity, MessageTarget, StreamItem};
 use tsproto_packets::packets::{AudioData, CodecType, OutAudio};
 
 use crate::audio::{Downsampler, OpusFramer, TS_FRAME};
@@ -40,9 +38,18 @@ pub struct SpeakerInfo {
 /// Per-user audio, already split before mixing. Audio is 16 kHz mono f32.
 #[derive(Debug)]
 pub enum TrackEvent {
-    Start { speaker: SpeakerInfo, at: OffsetDateTime },
-    Audio { client_id: u16, samples: Vec<f32> },
-    End { client_id: u16, at: OffsetDateTime },
+    Start {
+        speaker: SpeakerInfo,
+        at: OffsetDateTime,
+    },
+    Audio {
+        client_id: u16,
+        samples: Vec<f32>,
+    },
+    End {
+        client_id: u16,
+        at: OffsetDateTime,
+    },
     /// Channel membership or names changed.
     UsersChanged,
 }
@@ -121,12 +128,21 @@ impl TsHandle {
         self.send(Command::Shutdown).await
     }
     async fn send(&self, cmd: Command) -> Result<()> {
-        self.tx.send(cmd).await.map_err(|_| anyhow::anyhow!("ts actor gone"))
+        self.tx
+            .send(cmd)
+            .await
+            .map_err(|_| anyhow::anyhow!("ts actor gone"))
     }
 }
 
 /// Spawn the TeamSpeak actor. Returns a handle and the stream of per-user audio.
-pub fn spawn(cfg: TeamSpeakConfig) -> Result<(TsHandle, mpsc::Receiver<TrackEvent>, tokio::task::JoinHandle<()>)> {
+pub fn spawn(
+    cfg: TeamSpeakConfig,
+) -> Result<(
+    TsHandle,
+    mpsc::Receiver<TrackEvent>,
+    tokio::task::JoinHandle<()>,
+)> {
     let identity = load_or_create_identity(&cfg.identity_file)?;
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
     let (track_tx, track_rx) = mpsc::channel(1024);
@@ -135,7 +151,14 @@ pub fn spawn(cfg: TeamSpeakConfig) -> Result<(TsHandle, mpsc::Receiver<TrackEven
         let mut actor = Actor::new(cfg, identity, cmd_rx, track_tx, playing_tx);
         actor.run().await;
     });
-    Ok((TsHandle { tx: cmd_tx, playing: playing_rx }, track_rx, task))
+    Ok((
+        TsHandle {
+            tx: cmd_tx,
+            playing: playing_rx,
+        },
+        track_rx,
+        task,
+    ))
 }
 
 fn load_or_create_identity(path: &Path) -> Result<Identity> {
@@ -143,7 +166,11 @@ fn load_or_create_identity(path: &Path) -> Result<Identity> {
         let text = std::fs::read_to_string(path)?;
         let id: Identity = serde_json::from_str(&text)
             .with_context(|| format!("parsing identity {}", path.display()))?;
-        info!(level = id.level(), "loaded identity from {}", path.display());
+        info!(
+            level = id.level(),
+            "loaded identity from {}",
+            path.display()
+        );
         return Ok(id);
     }
     info!("creating new identity at {}", path.display());
@@ -231,17 +258,25 @@ impl Actor {
 
     fn set_playing(&mut self, v: bool) {
         self.playing = v;
-        self.playing_tx.send_if_modified(|p| std::mem::replace(p, v) != v);
+        self.playing_tx
+            .send_if_modified(|p| std::mem::replace(p, v) != v);
     }
 
     fn is_ignored(&self, con: &Connection, id: ClientId) -> bool {
         if self.cfg.ignore_clients.is_empty() {
             return false;
         }
-        let Ok(state) = con.get_state() else { return false };
-        let Some(c) = state.clients.get(&id) else { return false };
+        let Ok(state) = con.get_state() else {
+            return false;
+        };
+        let Some(c) = state.clients.get(&id) else {
+            return false;
+        };
         let uid = c.uid.as_ref().map(|u| u.to_string());
-        self.cfg.ignore_clients.iter().any(|x| *x == c.name || Some(x) == uid.as_ref())
+        self.cfg
+            .ignore_clients
+            .iter()
+            .any(|x| *x == c.name || Some(x) == uid.as_ref())
     }
 
     async fn run(&mut self) {
@@ -329,11 +364,34 @@ impl Actor {
     }
 
     async fn disconnect(&mut self, mut con: Connection) {
+        // tsclientlib panics if disconnect is driven while the initial handshake
+        // is still in progress. In that case simply drop the connection.
+        if !self.connected {
+            info!("dropping unfinished connection");
+            drop(con);
+            self.on_disconnected();
+            return;
+        }
         info!("disconnecting");
         if con.disconnect(DisconnectOptions::new()).is_ok() {
-            let drain = con.events().for_each(|_| futures::future::ready(()));
-            let _ = timeout(Duration::from_secs(3), drain).await;
+            // Do not use `for_each` here: a busy audio stream can keep it
+            // ready forever and starve the timeout. Select the deadline on
+            // every event instead.
+            let mut events = con.events();
+            let deadline = sleep(Duration::from_secs(3));
+            tokio::pin!(deadline);
+            loop {
+                tokio::select! {
+                    _ = &mut deadline => break,
+                    item = events.next() => {
+                        if item.is_none() {
+                            break;
+                        }
+                    }
+                }
+            }
         }
+        drop(con);
         self.on_disconnected();
     }
 
@@ -416,11 +474,18 @@ impl Actor {
     fn log_book_event(&self, con: &Connection, e: &Event) -> bool {
         use tsclientlib::events::PropertyId;
         match e {
-            Event::Message { target, invoker, message } => {
+            Event::Message {
+                target,
+                invoker,
+                message,
+            } => {
                 info!(?target, from = %invoker.name, "text message: {message}");
                 false
             }
-            Event::PropertyAdded { id: PropertyId::Client(id), .. } => {
+            Event::PropertyAdded {
+                id: PropertyId::Client(id),
+                ..
+            } => {
                 if let Ok(state) = con.get_state()
                     && let Some(c) = state.clients.get(id)
                 {
@@ -428,11 +493,17 @@ impl Actor {
                 }
                 true
             }
-            Event::PropertyRemoved { id: PropertyId::Client(id), .. } => {
+            Event::PropertyRemoved {
+                id: PropertyId::Client(id),
+                ..
+            } => {
                 info!(client_id = id.0, "client left");
                 true
             }
-            Event::PropertyChanged { id: PropertyId::ClientChannel(id), .. } => {
+            Event::PropertyChanged {
+                id: PropertyId::ClientChannel(id),
+                ..
+            } => {
                 if let Ok(state) = con.get_state()
                     && let Some(c) = state.clients.get(id)
                 {
@@ -440,7 +511,10 @@ impl Actor {
                 }
                 true
             }
-            Event::PropertyChanged { id: PropertyId::ClientName(_), .. } => true,
+            Event::PropertyChanged {
+                id: PropertyId::ClientName(_),
+                ..
+            } => true,
             _ => false,
         }
     }
@@ -461,8 +535,11 @@ impl Actor {
             info.database_id = Some(c.database_id.0);
             info.name = c.name.clone();
             info.channel_id = c.channel.0;
-            info.channel_name =
-                state.channels.get(&c.channel).map(|ch| ch.name.clone()).unwrap_or_default();
+            info.channel_name = state
+                .channels
+                .get(&c.channel)
+                .map(|ch| ch.name.clone())
+                .unwrap_or_default();
         }
         info
     }
@@ -480,8 +557,17 @@ impl Actor {
         };
         let speaker = Self::speaker_info(con, id);
         debug!(client_id = id.0, name = %speaker.name, "speaker started");
-        self.tracks.insert(id, Track { down, out: Vec::new() });
-        self.emit(TrackEvent::Start { speaker, at: OffsetDateTime::now_utc() });
+        self.tracks.insert(
+            id,
+            Track {
+                down,
+                out: Vec::new(),
+            },
+        );
+        self.emit(TrackEvent::Start {
+            speaker,
+            at: OffsetDateTime::now_utc(),
+        });
     }
 
     fn end_track(&mut self, id: ClientId) {
@@ -490,9 +576,15 @@ impl Actor {
                 warn!("resampler flush failed: {e:#}");
             }
             if !t.out.is_empty() {
-                self.emit(TrackEvent::Audio { client_id: id.0, samples: t.out });
+                self.emit(TrackEvent::Audio {
+                    client_id: id.0,
+                    samples: t.out,
+                });
             }
-            self.emit(TrackEvent::End { client_id: id.0, at: OffsetDateTime::now_utc() });
+            self.emit(TrackEvent::End {
+                client_id: id.0,
+                at: OffsetDateTime::now_utc(),
+            });
         }
     }
 
@@ -506,14 +598,21 @@ impl Actor {
         // Receive: pull 20 ms per active client, before mixing.
         self.mix_buf.iter_mut().for_each(|s| *s = 0.0);
         let tracks = &mut self.tracks;
-        let ended = self.audio.fill_buffer_with_proc(&mut self.mix_buf, |id, stereo| {
-            if let Some(t) = tracks.get_mut(id) {
-                let mono: Vec<f32> = stereo.as_chunks::<2>().0.iter().map(|[l, r]| (l + r) * 0.5).collect();
-                if let Err(e) = t.down.push(&mono, &mut t.out) {
-                    warn!("resample failed: {e:#}");
+        let ended = self
+            .audio
+            .fill_buffer_with_proc(&mut self.mix_buf, |id, stereo| {
+                if let Some(t) = tracks.get_mut(id) {
+                    let mono: Vec<f32> = stereo
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|[l, r]| (l + r) * 0.5)
+                        .collect();
+                    if let Err(e) = t.down.push(&mono, &mut t.out) {
+                        warn!("resample failed: {e:#}");
+                    }
                 }
-            }
-        });
+            });
         let chunks: Vec<(ClientId, Vec<f32>)> = self
             .tracks
             .iter_mut()
@@ -521,7 +620,10 @@ impl Actor {
             .map(|(id, t)| (*id, std::mem::take(&mut t.out)))
             .collect();
         for (id, samples) in chunks {
-            self.emit(TrackEvent::Audio { client_id: id.0, samples });
+            self.emit(TrackEvent::Audio {
+                client_id: id.0,
+                samples,
+            });
         }
         for id in ended {
             self.end_track(id);
@@ -530,7 +632,11 @@ impl Actor {
         // Send: one Opus frame per tick.
         if let Some(frame) = self.play_queue.pop_front() {
             self.set_playing(true);
-            let pkt = OutAudio::new(&AudioData::C2S { id: 0, codec: CodecType::OpusVoice, data: &frame });
+            let pkt = OutAudio::new(&AudioData::C2S {
+                id: 0,
+                codec: CodecType::OpusVoice,
+                data: &frame,
+            });
             if let Err(e) = con.send_audio(pkt) {
                 warn!("send_audio failed: {e}");
             }
@@ -541,7 +647,11 @@ impl Actor {
     }
 
     fn send_audio_end(&self, con: &mut Connection) {
-        let pkt = OutAudio::new(&AudioData::C2S { id: 0, codec: CodecType::OpusVoice, data: &[] });
+        let pkt = OutAudio::new(&AudioData::C2S {
+            id: 0,
+            codec: CodecType::OpusVoice,
+            data: &[],
+        });
         let _ = con.send_audio(pkt);
     }
 
@@ -628,7 +738,10 @@ impl Actor {
     fn status(&self, con: Option<&Connection>) -> BotStatus {
         let state = con.and_then(|c| c.get_state().ok());
         let own = state.map(|s| s.own_client);
-        let channel = state.zip(own).and_then(|(s, o)| s.clients.get(&o)).map(|c| c.channel);
+        let channel = state
+            .zip(own)
+            .and_then(|(s, o)| s.clients.get(&o))
+            .map(|c| c.channel);
         let channel_name = state
             .zip(channel)
             .and_then(|(s, ch)| s.channels.get(&ch))

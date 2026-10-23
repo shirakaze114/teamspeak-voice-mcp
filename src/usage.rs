@@ -56,7 +56,12 @@ pub fn price_per_second(model: &str) -> f64 {
 
 fn today() -> String {
     let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
-    format!("{:04}-{:02}-{:02}", now.year(), now.month() as u8, now.day())
+    format!(
+        "{:04}-{:02}-{:02}",
+        now.year(),
+        now.month() as u8,
+        now.day()
+    )
 }
 
 impl Usage {
@@ -66,21 +71,33 @@ impl Usage {
             .ok()
             .and_then(|t| serde_json::from_str(&t).ok())
             .unwrap_or_default();
-        Self { cfg, path, data: Mutex::new(data) }
+        Self {
+            cfg,
+            path,
+            data: Mutex::new(data),
+        }
     }
 
     /// Returns `Err(reason)` if `seconds` more audio would exceed a limit.
     pub fn check(&self, seconds: f64) -> Result<(), String> {
         let d = self.data.lock().unwrap();
-        let today_used: f64 = d.daily.get(&today()).map(|m| m.values().sum()).unwrap_or(0.0);
-        let total_used: f64 = d.total.values().sum();
-        if self.cfg.daily_limit_seconds > 0 && today_used + seconds > self.cfg.daily_limit_seconds as f64 {
+        let today_used: f64 = d
+            .daily
+            .get(&today())
+            .map(|m| m.values().fold(0.0, |a, b| a + b))
+            .unwrap_or(0.0);
+        let total_used: f64 = d.total.values().fold(0.0, |a, b| a + b);
+        if self.cfg.daily_limit_seconds > 0
+            && today_used + seconds > self.cfg.daily_limit_seconds as f64
+        {
             return Err(format!(
                 "daily ASR limit reached ({today_used:.0}/{} s)",
                 self.cfg.daily_limit_seconds
             ));
         }
-        if self.cfg.total_limit_seconds > 0 && total_used + seconds > self.cfg.total_limit_seconds as f64 {
+        if self.cfg.total_limit_seconds > 0
+            && total_used + seconds > self.cfg.total_limit_seconds as f64
+        {
             return Err(format!(
                 "total ASR limit reached ({total_used:.0}/{} s)",
                 self.cfg.total_limit_seconds
@@ -93,7 +110,11 @@ impl Usage {
         let snapshot = {
             let mut d = self.data.lock().unwrap();
             *d.total.entry(model.to_string()).or_default() += seconds;
-            *d.daily.entry(today()).or_default().entry(model.to_string()).or_default() += seconds;
+            *d.daily
+                .entry(today())
+                .or_default()
+                .entry(model.to_string())
+                .or_default() += seconds;
             d.requests += 1;
             // Keep 60 days of daily history.
             while d.daily.len() > 60 {
@@ -131,10 +152,13 @@ impl Usage {
     pub fn snapshot(&self) -> UsageSnapshot {
         let d = self.data.lock().unwrap();
         let today_per_model = d.daily.get(&today()).cloned().unwrap_or_default();
-        let cost = d.total.iter().map(|(m, s)| price_per_second(m) * s).sum();
+        let cost = d
+            .total
+            .iter()
+            .fold(0.0, |acc, (m, s)| acc + price_per_second(m) * s);
         UsageSnapshot {
-            today_seconds: today_per_model.values().sum(),
-            total_seconds: d.total.values().sum(),
+            today_seconds: today_per_model.values().fold(0.0, |a, b| a + b),
+            total_seconds: d.total.values().fold(0.0, |a, b| a + b),
             daily_limit_seconds: self.cfg.daily_limit_seconds,
             total_limit_seconds: self.cfg.total_limit_seconds,
             per_model_total: d.total.clone(),
@@ -153,7 +177,11 @@ mod tests {
     #[test]
     fn limits_are_enforced() {
         let dir = std::env::temp_dir().join(format!("tsv_usage_{}", std::process::id()));
-        let cfg = BudgetConfig { daily_limit_seconds: 10, total_limit_seconds: 0, usage_file: dir.join("u.json") };
+        let cfg = BudgetConfig {
+            daily_limit_seconds: 10,
+            total_limit_seconds: 0,
+            usage_file: dir.join("u.json"),
+        };
         let u = Usage::load(cfg.clone());
         assert!(u.check(5.0).is_ok());
         u.record("qwen-audio-3.0-asr-flash", 8.0);

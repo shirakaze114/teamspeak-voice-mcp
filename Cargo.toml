@@ -21,8 +21,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 silero = "0.7"
 symphonia = { version = "0.6", default-features = false, features = ["wav", "pcm", "mp3", "flac", "ogg", "vorbis"] }
-time = { version = "0.3", features = ["formatting"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "io-std", "io-util", "fs"] }
+time = { version = "0.3", features = ["formatting", "local-offset"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "io-std", "io-util", "fs", "process"] }
 tokio-stream = { version = "0.1.19", features = ["sync"] }
 tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
 tokio-util = "0.7.20"

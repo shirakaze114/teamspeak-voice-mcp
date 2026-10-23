@@ -48,13 +48,19 @@ pub struct FullStatus {
 impl App {
     pub fn authenticate(&self, token: Option<&str>) -> Option<Caller> {
         if self.auth_disabled {
-            return Some(Caller { name: "anonymous".into(), scopes: vec![Scope::Admin] });
+            return Some(Caller {
+                name: "anonymous".into(),
+                scopes: vec![Scope::Admin],
+            });
         }
         let token = token?;
         self.tokens
             .iter()
             .find(|t| ct_eq(t.token.as_bytes(), token.as_bytes()))
-            .map(|t| Caller { name: t.name.clone(), scopes: t.scopes.clone() })
+            .map(|t| Caller {
+                name: t.name.clone(),
+                scopes: t.scopes.clone(),
+            })
     }
 
     pub async fn status(&self) -> FullStatus {

@@ -94,8 +94,10 @@ pub enum AsrMode {
 pub struct AsrConfig {
     pub enabled: bool,
     pub mode: AsrMode,
-    /// Read from `DASHSCOPE_API_KEY` when unset.
+    /// Read from `api_key_file`, then `DASHSCOPE_API_KEY`, when unset.
     pub api_key: Option<String>,
+    /// Optional local file containing only the API key (not committed).
+    pub api_key_file: Option<PathBuf>,
     pub http_model: String,
     pub streaming_model: String,
     pub http_url: String,
@@ -117,6 +119,7 @@ impl Default for AsrConfig {
             enabled: true,
             mode: AsrMode::Http,
             api_key: None,
+            api_key_file: None,
             http_model: "qwen-audio-3.0-asr-flash".into(),
             streaming_model: "qwen-audio-3.0-asr-flash-streaming".into(),
             http_url: "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation".into(),
@@ -143,7 +146,11 @@ pub struct BudgetConfig {
 
 impl Default for BudgetConfig {
     fn default() -> Self {
-        Self { daily_limit_seconds: 3600, total_limit_seconds: 0, usage_file: "data/usage.json".into() }
+        Self {
+            daily_limit_seconds: 3600,
+            total_limit_seconds: 0,
+            usage_file: "data/usage.json".into(),
+        }
     }
 }
 
@@ -153,6 +160,9 @@ pub enum TtsKind {
     None,
     /// OpenAI-compatible `POST {base_url}/audio/speech`.
     Openai,
+    /// Run a local executable; arguments support `{text}` and `{output}`.
+    #[serde(alias = "command")]
+    Local,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -179,6 +189,12 @@ pub struct TtsConfig {
     pub max_chars: usize,
     pub volume: f32,
     pub request_timeout_s: u64,
+    /// Executable for `kind = "local"` (for example `say`, `espeak-ng`, or `piper`).
+    pub command: Option<String>,
+    /// Arguments for the executable. `{text}` is replaced by the input text;
+    /// `{output}` is replaced by a temporary WAV path. Without `{output}`,
+    /// the command's stdout is used as audio bytes.
+    pub args: Vec<String>,
 }
 
 impl Default for TtsConfig {
@@ -195,6 +211,8 @@ impl Default for TtsConfig {
             max_chars: 500,
             volume: 1.0,
             request_timeout_s: 60,
+            command: None,
+            args: Vec::new(),
         }
     }
 }
@@ -231,7 +249,12 @@ pub struct ServerConfig {
 
 impl Default for ServerConfig {
     fn default() -> Self {
-        Self { bind: "127.0.0.1:8787".into(), allowed_hosts: vec![], tokens: vec![], auth_disabled: false }
+        Self {
+            bind: "127.0.0.1:8787".into(),
+            allowed_hosts: vec![],
+            tokens: vec![],
+            auth_disabled: false,
+        }
     }
 }
 
@@ -247,7 +270,12 @@ pub struct TranscriptConfig {
 
 impl Default for TranscriptConfig {
     fn default() -> Self {
-        Self { retention_hours: 24, max_events: 5000, persist: false, file: "data/transcripts.jsonl".into() }
+        Self {
+            retention_hours: 24,
+            max_events: 5000,
+            persist: false,
+            file: "data/transcripts.jsonl".into(),
+        }
     }
 }
 
@@ -261,7 +289,10 @@ pub struct RecordingConfig {
 
 impl Default for RecordingConfig {
     fn default() -> Self {
-        Self { enabled: false, dir: "data/recordings".into() }
+        Self {
+            enabled: false,
+            dir: "data/recordings".into(),
+        }
     }
 }
 
@@ -292,6 +323,17 @@ impl Config {
         if let Some(v) = env("TS_CHANNEL_PASSWORD") {
             cfg.teamspeak.channel_password = Some(v);
         }
+        if cfg.asr.api_key.is_none()
+            && let Some(key_file) = cfg.asr.api_key_file.clone()
+        {
+            let key = std::fs::read_to_string(&key_file)
+                .with_context(|| format!("reading ASR key file {}", key_file.display()))?;
+            let key = key.trim();
+            if key.is_empty() {
+                bail!("ASR key file {} is empty", key_file.display());
+            }
+            cfg.asr.api_key = Some(key.to_owned());
+        }
         if cfg.asr.api_key.is_none() {
             cfg.asr.api_key = env("DASHSCOPE_API_KEY");
         }
@@ -299,7 +341,11 @@ impl Config {
             cfg.tts.api_key = env("TTS_API_KEY");
         }
         if let Some(t) = env("TSVOICE_ADMIN_TOKEN") {
-            cfg.server.tokens.push(TokenConfig { name: "env-admin".into(), token: t, scopes: vec![Scope::Admin] });
+            cfg.server.tokens.push(TokenConfig {
+                name: "env-admin".into(),
+                token: t,
+                scopes: vec![Scope::Admin],
+            });
         }
         cfg.validate()?;
         Ok(cfg)
@@ -315,14 +361,19 @@ impl Config {
             bail!("no API tokens configured: add [[server.tokens]] or set TSVOICE_ADMIN_TOKEN");
         }
         if self.server.auth_disabled {
-            let addr: std::net::SocketAddr =
-                self.server.bind.parse().context("server.bind must be ip:port")?;
+            let addr: std::net::SocketAddr = self
+                .server
+                .bind
+                .parse()
+                .context("server.bind must be ip:port")?;
             if !addr.ip().is_loopback() {
                 bail!("server.auth_disabled is only allowed with a loopback bind address");
             }
         }
         let v = &self.vad;
-        if !(0.01..=1.0).contains(&v.threshold) || v.neg_threshold.is_some_and(|n| n > v.threshold || n < 0.01) {
+        if !(0.01..=1.0).contains(&v.threshold)
+            || v.neg_threshold.is_some_and(|n| n > v.threshold || n < 0.01)
+        {
             bail!("vad thresholds must satisfy 0.01 <= neg_threshold <= threshold <= 1");
         }
         if self.asr.hotwords.values().any(|w| !(1..=5).contains(w)) {

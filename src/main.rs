@@ -1,125 +1,136 @@
-//! Phase-1 prototype: connect to TeamSpeak, split voice per user, record each
-//! utterance to WAV, and play WAV files / send text from a stdin console.
+//! TeamSpeak 3 voice bot: per-user VAD + ASR, MCP server and control panel.
 
+mod app;
+mod asr;
 mod audio;
 mod config;
+mod mcp;
+mod pipeline;
+mod transcripts;
 mod ts;
+mod tts;
+mod usage;
+mod web;
 
-use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Parser;
-use time::OffsetDateTime;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::audio::{ASR_RATE, TS_RATE};
-use crate::config::{Config, RecordingConfig};
-use crate::ts::{SpeakerInfo, TrackEvent, TsHandle};
+use crate::app::App;
+use crate::config::Config;
+use crate::pipeline::Pipeline;
+use crate::transcripts::TranscriptStore;
+use crate::usage::Usage;
 
 #[derive(Parser, Debug)]
-#[command(about = "TeamSpeak 3 voice bot (phase-1 prototype)")]
+#[command(about = "TeamSpeak 3 voice bot with MCP server and control panel")]
 struct Args {
     /// Path to the TOML config file.
     #[arg(short, long, default_value = "config.toml")]
     config: PathBuf,
+    /// Also enable the small stdin console (users/status/say/msg/stop/asr).
+    #[arg(long)]
+    console: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,tsproto=warn,tsproto::packet_codec=error,tsclientlib=warn".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                "info,tsproto=warn,tsproto::packet_codec=error,tsclientlib=warn".into()
+            }),
         )
         .init();
 
     let args = Args::parse();
     let cfg = Config::load(&args.config)?;
+    let shutdown = CancellationToken::new();
 
-    let (ts, tracks, ts_task) = ts::spawn(cfg.teamspeak.clone())?;
-    tokio::spawn(record_tracks(tracks, cfg.recording.clone()));
-    tokio::spawn(console(ts.clone()));
+    let (ts, tracks, mut ts_task) = ts::spawn(cfg.teamspeak.clone())?;
+    let usage = Arc::new(Usage::load(cfg.asr.budget.clone()));
+    let asr = Arc::new(asr::Asr::new(cfg.asr.clone(), usage)?);
+    let store = Arc::new(TranscriptStore::new(cfg.transcripts.clone()));
+    let speaker = Arc::new(tts::Speaker::new(cfg.tts.clone(), ts.clone())?);
+    if !speaker.available() {
+        warn!("TTS not configured: ts_speak will fail until [tts] is set up");
+    }
+    if asr.state().enabled && !asr.state().has_api_key {
+        warn!("DASHSCOPE_API_KEY is not set: transcription disabled");
+    }
+
+    let pipeline = Pipeline::new(
+        cfg.vad.clone(),
+        asr.clone(),
+        store.clone(),
+        ts.clone(),
+        cfg.recording.clone(),
+        cfg.asr.context_messages,
+    )?;
+    let pipeline_task = tokio::spawn(pipeline.run(tracks));
+
+    let app = Arc::new(App {
+        ts: ts.clone(),
+        asr,
+        store: store.clone(),
+        tts: speaker,
+        started: std::time::Instant::now(),
+        tokens: cfg.server.tokens.clone(),
+        auth_disabled: cfg.server.auth_disabled,
+    });
+
+    let mut web_task = tokio::spawn(web::serve(
+        app.clone(),
+        cfg.server.clone(),
+        shutdown.clone(),
+    ));
+    let retention_task = tokio::spawn({
+        let store = store.clone();
+        async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                store.compact_file();
+            }
+        }
+    });
+    if args.console {
+        tokio::spawn(console(ts.clone(), store.clone()));
+    }
 
     tokio::signal::ctrl_c().await?;
-    info!("ctrl-c received");
+    info!("ctrl-c received, shutting down");
+    shutdown.cancel();
     ts.shutdown().await.ok();
-    ts_task.await.ok();
+    // A busy TS stream or a long-lived MCP/SSE connection must not prevent
+    // Ctrl-C from terminating the process indefinitely.
+    if tokio::time::timeout(std::time::Duration::from_secs(4), &mut ts_task)
+        .await
+        .is_err()
+    {
+        warn!("TS shutdown timed out; aborting connection task");
+        ts_task.abort();
+    }
+    pipeline_task.abort();
+    retention_task.abort();
+    if tokio::time::timeout(std::time::Duration::from_secs(3), &mut web_task)
+        .await
+        .is_err()
+    {
+        warn!("HTTP shutdown timed out; aborting web task");
+        web_task.abort();
+    }
     Ok(())
 }
 
-struct Utterance {
-    speaker: SpeakerInfo,
-    started: OffsetDateTime,
-    pcm: Vec<f32>,
-}
-
-/// Writes one WAV file per user utterance and logs the per-user boundaries.
-async fn record_tracks(mut rx: mpsc::Receiver<TrackEvent>, cfg: RecordingConfig) {
-    if cfg.enabled
-        && let Err(e) = tokio::fs::create_dir_all(&cfg.dir).await
-    {
-        warn!("cannot create recording dir: {e}");
-    }
-    let mut active: HashMap<u16, Utterance> = HashMap::new();
-    while let Some(ev) = rx.recv().await {
-        match ev {
-            TrackEvent::Start { speaker, at } => {
-                info!(client_id = speaker.client_id, name = %speaker.name, channel = speaker.channel_id, "▶ talking");
-                active.insert(speaker.client_id, Utterance { speaker, started: at, pcm: Vec::new() });
-            }
-            TrackEvent::Audio { client_id, samples } => {
-                if let Some(u) = active.get_mut(&client_id) {
-                    u.pcm.extend_from_slice(&samples);
-                }
-            }
-            TrackEvent::End { client_id, at } => {
-                let Some(u) = active.remove(&client_id) else { continue };
-                let ms = u.pcm.len() as u64 * 1000 / ASR_RATE as u64;
-                let rms = rms(&u.pcm);
-                info!(client_id, name = %u.speaker.name, ms, rms = format!("{rms:.4}"), "■ stopped");
-                if !cfg.enabled || ms < cfg.min_utterance_ms as u64 {
-                    continue;
-                }
-                let stamp = u.started.unix_timestamp_nanos() / 1_000_000;
-                let path = cfg.dir.join(format!("{stamp}_c{}_{}.wav", client_id, sanitize(&u.speaker.name)));
-                let _ = at;
-                let pcm = u.pcm;
-                let res = tokio::task::spawn_blocking({
-                    let path = path.clone();
-                    move || audio::write_wav_mono(&path, &pcm, ASR_RATE)
-                })
-                .await;
-                match res {
-                    Ok(Ok(())) => info!("saved {}", path.display()),
-                    Ok(Err(e)) => warn!("saving wav failed: {e:#}"),
-                    Err(e) => warn!("saving wav panicked: {e}"),
-                }
-            }
-        }
-    }
-}
-
-fn rms(pcm: &[f32]) -> f32 {
-    if pcm.is_empty() {
-        return 0.0;
-    }
-    (pcm.iter().map(|s| s * s).sum::<f32>() / pcm.len() as f32).sqrt()
-}
-
-fn sanitize(name: &str) -> String {
-    name.chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
-        .take(32)
-        .collect()
-}
-
 /// Minimal stdin console for manual testing.
-async fn console(ts: TsHandle) {
+async fn console(ts: ts::TsHandle, store: Arc<TranscriptStore>) {
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    println!("commands: users | status | say <file.wav> | msg <text> | stop");
+    println!("commands: users | status | say <audio file> | msg <text> | stop | transcripts");
     while let Ok(Some(line)) = lines.next_line().await {
         let line = line.trim();
         let (cmd, rest) = line.split_once(' ').unwrap_or((line, ""));
@@ -129,24 +140,33 @@ async fn console(ts: TsHandle) {
                 "" => {}
                 "users" => {
                     for u in ts.list_users().await? {
-                        println!("{:>5}  {}{}{}", u.client_id, u.name,
+                        println!(
+                            "{:>5}  {}{}{}",
+                            u.client_id,
+                            u.name,
                             if u.is_self { "  (bot)" } else { "" },
-                            if u.talking { "  [talking]" } else { "" });
+                            if u.talking { "  [talking]" } else { "" }
+                        );
                     }
                 }
                 "status" => println!("{}", serde_json::to_string_pretty(&ts.status().await?)?),
                 "say" => {
                     let path = PathBuf::from(rest);
-                    let pcm = tokio::task::spawn_blocking(move || -> Result<Vec<f32>> {
-                        let (mono, rate) = audio::load_wav_mono(&path)?;
-                        audio::resample_clip(&mono, rate, TS_RATE)
-                    })
-                    .await??;
-                    println!("queued {:.1}s", pcm.len() as f32 / TS_RATE as f32);
+                    let pcm = tokio::task::spawn_blocking(move || audio::load_for_playback(&path))
+                        .await??;
+                    println!("queued {:.1}s", pcm.len() as f32 / audio::TS_RATE as f32);
                     ts.play(pcm).await?;
                 }
                 "msg" => ts.send_channel_message(rest.to_string()).await?,
                 "stop" => ts.stop_playback().await?,
+                "transcripts" => {
+                    for e in store.query(&transcripts::Query {
+                        limit: 10,
+                        ..Default::default()
+                    }) {
+                        println!("[{}] {}: {}", e.timestamp, e.speaker.name, e.text);
+                    }
+                }
                 other => println!("unknown command: {other}"),
             }
             Ok(())

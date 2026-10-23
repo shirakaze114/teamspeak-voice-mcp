@@ -8,11 +8,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use async_openai::Client;
 use async_openai::config::OpenAIConfig;
 use async_openai::types::audio::{CreateSpeechRequest, SpeechModel, SpeechResponseFormat, Voice};
+use tokio::process::Command;
 use tokio::sync::Mutex;
+use tokio::time::timeout;
 use tracing::{info, warn};
 
 use crate::audio::{self, TS_RATE};
@@ -32,7 +34,7 @@ pub struct Speaker {
 impl Speaker {
     pub fn new(cfg: TtsConfig, ts: TsHandle) -> Result<Self> {
         let client = match cfg.kind {
-            TtsKind::None => None,
+            TtsKind::None | TtsKind::Local => None,
             TtsKind::Openai => {
                 let mut c = OpenAIConfig::new().with_api_base(cfg.base_url.trim_end_matches('/'));
                 if let Some(k) = &cfg.api_key {
@@ -44,17 +46,31 @@ impl Speaker {
                 Some(Client::with_config(c).with_http_client(http))
             }
         };
-        Ok(Self { cfg, client, ts, generation: AtomicU64::new(0), turn: Mutex::new(()) })
+        Ok(Self {
+            cfg,
+            client,
+            ts,
+            generation: AtomicU64::new(0),
+            turn: Mutex::new(()),
+        })
     }
 
     pub fn available(&self) -> bool {
-        self.client.is_some()
+        match self.cfg.kind {
+            TtsKind::None => false,
+            TtsKind::Openai => self.client.is_some(),
+            TtsKind::Local => self
+                .cfg
+                .command
+                .as_deref()
+                .is_some_and(|c| !c.trim().is_empty()),
+        }
     }
 
     /// Queue `text` for playback. Returns once accepted; synthesis runs in the background.
     pub fn speak(self: &Arc<Self>, text: &str, interrupt: bool) -> Result<usize> {
-        if self.client.is_none() {
-            bail!("TTS is not configured ([tts] kind = \"none\")");
+        if !self.available() {
+            bail!("TTS is not configured; set [tts] kind = \"openai\" or \"local\"");
         }
         let text = text.trim();
         if text.is_empty() {
@@ -110,19 +126,28 @@ impl Speaker {
 
     /// Synthesize one sentence to 48 kHz mono PCM.
     async fn synthesize(&self, text: &str) -> Result<Vec<f32>> {
-        let client = self.client.as_ref().ok_or_else(|| anyhow!("TTS not configured"))?;
-        let req = CreateSpeechRequest {
-            input: text.to_string(),
-            model: SpeechModel::Other(self.cfg.model.clone()),
-            voice: Voice::Other(self.cfg.voice.clone()),
-            response_format: Some(match self.cfg.format {
-                TtsFormat::Wav => SpeechResponseFormat::Wav,
-                TtsFormat::Pcm => SpeechResponseFormat::Pcm,
-            }),
-            speed: self.cfg.speed,
-            ..Default::default()
+        let bytes = match self.cfg.kind {
+            TtsKind::Openai => {
+                let client = self
+                    .client
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("TTS not configured"))?;
+                let req = CreateSpeechRequest {
+                    input: text.to_string(),
+                    model: SpeechModel::Other(self.cfg.model.clone()),
+                    voice: Voice::Other(self.cfg.voice.clone()),
+                    response_format: Some(match self.cfg.format {
+                        TtsFormat::Wav => SpeechResponseFormat::Wav,
+                        TtsFormat::Pcm => SpeechResponseFormat::Pcm,
+                    }),
+                    speed: self.cfg.speed,
+                    ..Default::default()
+                };
+                client.audio().speech().create(req).await?.bytes.to_vec()
+            }
+            TtsKind::Local => self.run_local(text).await?,
+            TtsKind::None => bail!("TTS not configured"),
         };
-        let bytes = client.audio().speech().create(req).await?.bytes.to_vec();
         let cfg = self.cfg.clone();
         tokio::task::spawn_blocking(move || -> Result<Vec<f32>> {
             let (mono, rate) = match cfg.format {
@@ -131,11 +156,61 @@ impl Speaker {
             };
             let mut pcm = audio::resample_clip(&mono, rate, TS_RATE)?;
             if cfg.volume != 1.0 {
-                pcm.iter_mut().for_each(|s| *s = (*s * cfg.volume).clamp(-1.0, 1.0));
+                pcm.iter_mut()
+                    .for_each(|s| *s = (*s * cfg.volume).clamp(-1.0, 1.0));
             }
             Ok(pcm)
         })
         .await?
+    }
+
+    /// Run a local synthesizer without a shell, so text cannot inject commands.
+    async fn run_local(&self, text: &str) -> Result<Vec<u8>> {
+        let program = self
+            .cfg
+            .command
+            .as_deref()
+            .filter(|p| !p.trim().is_empty())
+            .ok_or_else(|| anyhow!("[tts].command is required for local TTS"))?;
+        let output_path =
+            std::env::temp_dir().join(format!("tsvoice-tts-{}.wav", uuid::Uuid::new_v4()));
+        let output_arg = output_path.to_string_lossy().into_owned();
+        let mut command = Command::new(program);
+        let mut has_text = false;
+        let mut writes_file = false;
+        for arg in &self.cfg.args {
+            has_text |= arg.contains("{text}");
+            writes_file |= arg.contains("{output}");
+            command.arg(arg.replace("{text}", text).replace("{output}", &output_arg));
+        }
+        if !has_text {
+            bail!("local TTS args must contain {{text}}");
+        }
+        let output = timeout(
+            Duration::from_secs(self.cfg.request_timeout_s),
+            command.output(),
+        )
+        .await
+        .context("local TTS command timed out")??;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!(
+                "local TTS exited with {}: {}",
+                output.status,
+                stderr.chars().take(300).collect::<String>()
+            );
+        }
+        let bytes = if writes_file {
+            let result = tokio::fs::read(&output_path).await;
+            let _ = tokio::fs::remove_file(&output_path).await;
+            result?
+        } else {
+            output.stdout
+        };
+        if bytes.is_empty() {
+            bail!("local TTS returned no audio");
+        }
+        Ok(bytes)
     }
 }
 
@@ -154,9 +229,13 @@ fn split_sentences(text: &str) -> Vec<String> {
         parts.push(cur);
     }
     let mut merged: Vec<String> = Vec::new();
-    for p in parts.into_iter().map(|p| p.trim().to_string()).filter(|p| !p.is_empty()) {
+    for p in parts
+        .into_iter()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+    {
         match merged.last_mut() {
-            Some(last) if last.chars().count() + p.chars().count() <= 60 && merged.len() > 1 => last.push_str(&p),
+            Some(last) if last.chars().count() + p.chars().count() <= 60 => last.push_str(&p),
             _ => merged.push(p),
         }
     }
@@ -169,8 +248,21 @@ mod tests {
 
     #[test]
     fn splits_chinese_sentences() {
-        let s = split_sentences("你好！今天吃什么？我推荐火锅。还有烧烤");
-        assert_eq!(s[0], "你好！");
-        assert_eq!(s.concat(), "你好！今天吃什么？我推荐火锅。还有烧烤");
+        let text = "你好！今天吃什么？我推荐火锅。还有烧烤。明天去爬山。后天去看电影。你觉得怎么样？我们明天再详细讨论这个问题。".repeat(3);
+        let s = split_sentences(&text);
+        assert!(
+            s.len() > 1,
+            "long text should be split for streaming playback"
+        );
+        assert_eq!(s.concat(), text);
+        assert!(s.iter().all(|part| !part.is_empty()));
+    }
+
+    #[test]
+    fn short_text_is_one_chunk() {
+        assert_eq!(
+            split_sentences("你好！今天吃什么？"),
+            vec!["你好！今天吃什么？"]
+        );
     }
 }

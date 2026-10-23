@@ -2,8 +2,8 @@
 
 use std::collections::VecDeque;
 use std::io::Write;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -50,12 +50,18 @@ pub struct TranscriptEvent {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LiveEvent {
-    Transcript(TranscriptEvent),
+    Transcript(Box<TranscriptEvent>),
     /// Utterance started (VAD) or ended without a transcript.
-    Speech { client_id: u16, name: String, active: bool },
+    Speech {
+        client_id: u16,
+        name: String,
+        active: bool,
+    },
     UsersChanged,
-    Status,
-    Log { level: String, message: String },
+    Log {
+        level: String,
+        message: String,
+    },
 }
 
 pub struct TranscriptStore {
@@ -66,7 +72,8 @@ pub struct TranscriptStore {
 }
 
 pub fn rfc3339(t: OffsetDateTime) -> String {
-    t.format(&time::format_description::well_known::Rfc3339).unwrap_or_default()
+    t.format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default()
 }
 
 impl TranscriptStore {
@@ -84,9 +91,21 @@ impl TranscriptStore {
                 }
             }
         }
-        let store = Self { cfg, seq: AtomicU64::new(seq), events: Mutex::new(events), live };
+        let store = Self {
+            cfg,
+            seq: AtomicU64::new(seq),
+            events: Mutex::new(events),
+            live,
+        };
         store.prune();
         store
+    }
+
+    fn events(&self) -> MutexGuard<'_, VecDeque<TranscriptEvent>> {
+        // A panic in another thread must not make all transcripts unavailable.
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     pub fn next_seq(&self) -> u64 {
@@ -98,14 +117,14 @@ impl TranscriptStore {
         if self.cfg.persist {
             self.append_file(&ev);
         }
-        self.events.lock().unwrap().push_back(ev.clone());
+        self.events().push_back(ev.clone());
         self.prune();
-        let _ = self.live.send(LiveEvent::Transcript(ev));
+        let _ = self.live.send(LiveEvent::Transcript(Box::new(ev)));
     }
 
     /// Broadcast a partial result (not stored).
     pub fn push_partial(&self, ev: TranscriptEvent) {
-        let _ = self.live.send(LiveEvent::Transcript(ev));
+        let _ = self.live.send(LiveEvent::Transcript(Box::new(ev)));
     }
 
     pub fn emit(&self, ev: LiveEvent) {
@@ -113,16 +132,19 @@ impl TranscriptStore {
     }
 
     pub fn get(&self, event_id: &str) -> Option<TranscriptEvent> {
-        self.events.lock().unwrap().iter().find(|e| e.event_id == event_id).cloned()
+        self.events()
+            .iter()
+            .find(|e| e.event_id == event_id)
+            .cloned()
     }
 
     pub fn latest_seq(&self) -> u64 {
-        self.events.lock().unwrap().back().map(|e| e.seq).unwrap_or(0)
+        self.events().back().map(|e| e.seq).unwrap_or(0)
     }
 
     /// Query final transcripts, oldest first, limited to the newest `limit`.
     pub fn query(&self, q: &Query) -> Vec<TranscriptEvent> {
-        let events = self.events.lock().unwrap();
+        let events = self.events();
         let since = q.since.as_deref().and_then(|s| {
             OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).ok()
         });
@@ -134,9 +156,12 @@ impl TranscriptStore {
             .filter(|e| q.channel_id.is_none_or(|c| e.channel_id == c))
             .filter(|e| {
                 since.is_none_or(|s| {
-                    OffsetDateTime::parse(&e.timestamp, &time::format_description::well_known::Rfc3339)
-                        .map(|t| t >= s)
-                        .unwrap_or(true)
+                    OffsetDateTime::parse(
+                        &e.timestamp,
+                        &time::format_description::well_known::Rfc3339,
+                    )
+                    .map(|t| t >= s)
+                    .unwrap_or(true)
                 })
             })
             .take(q.limit.clamp(1, 500))
@@ -147,13 +172,17 @@ impl TranscriptStore {
     }
 
     fn prune(&self) {
-        let cutoff = OffsetDateTime::now_utc() - time::Duration::hours(self.cfg.retention_hours as i64);
-        let mut events = self.events.lock().unwrap();
+        let cutoff =
+            OffsetDateTime::now_utc() - time::Duration::hours(self.cfg.retention_hours as i64);
+        let mut events = self.events();
         while events.len() > self.cfg.max_events {
             events.pop_front();
         }
         while let Some(front) = events.front() {
-            let t = OffsetDateTime::parse(&front.timestamp, &time::format_description::well_known::Rfc3339);
+            let t = OffsetDateTime::parse(
+                &front.timestamp,
+                &time::format_description::well_known::Rfc3339,
+            );
             if t.map(|t| t < cutoff).unwrap_or(true) {
                 events.pop_front();
             } else {
@@ -168,7 +197,7 @@ impl TranscriptStore {
             return;
         }
         self.prune();
-        let events = self.events.lock().unwrap();
+        let events = self.events();
         let mut buf = Vec::new();
         for e in events.iter() {
             if let Ok(line) = serde_json::to_string(e) {
@@ -177,7 +206,9 @@ impl TranscriptStore {
             }
         }
         let tmp = self.cfg.file.with_extension("jsonl.tmp");
-        if let Err(e) = std::fs::write(&tmp, buf).and_then(|_| std::fs::rename(&tmp, &self.cfg.file)) {
+        if let Err(e) =
+            std::fs::write(&tmp, buf).and_then(|_| std::fs::rename(&tmp, &self.cfg.file))
+        {
             warn!("compacting transcript file failed: {e}");
         }
     }
@@ -229,7 +260,12 @@ mod tests {
             utterance_id: format!("utt_{seq}"),
             channel_id: 5,
             channel_name: "c".into(),
-            speaker: Speaker { client_id: client, name: "a".into(), uid: None, database_id: None },
+            speaker: Speaker {
+                client_id: client,
+                name: "a".into(),
+                uid: None,
+                database_id: None,
+            },
             text: text.into(),
             timestamp: rfc3339(OffsetDateTime::now_utc()),
             end_timestamp: None,
@@ -240,15 +276,32 @@ mod tests {
 
     #[test]
     fn query_filters_and_cursor() {
-        let store = TranscriptStore::new(TranscriptConfig { max_events: 3, ..Default::default() });
+        let store = TranscriptStore::new(TranscriptConfig {
+            max_events: 3,
+            ..Default::default()
+        });
         for i in 0..5 {
             store.push_final(ev(&store, i % 2, &format!("t{i}")));
         }
-        let all = store.query(&Query { limit: 10, ..Default::default() });
-        assert_eq!(all.iter().map(|e| e.text.as_str()).collect::<Vec<_>>(), ["t2", "t3", "t4"]);
-        let after = store.query(&Query { limit: 10, after_seq: Some(4), ..Default::default() });
+        let all = store.query(&Query {
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(
+            all.iter().map(|e| e.text.as_str()).collect::<Vec<_>>(),
+            ["t2", "t3", "t4"]
+        );
+        let after = store.query(&Query {
+            limit: 10,
+            after_seq: Some(4),
+            ..Default::default()
+        });
         assert_eq!(after.len(), 1);
-        let c1 = store.query(&Query { limit: 10, client_id: Some(1), ..Default::default() });
+        let c1 = store.query(&Query {
+            limit: 10,
+            client_id: Some(1),
+            ..Default::default()
+        });
         assert_eq!(c1.len(), 1);
         assert!(store.get("evt_5").is_some());
     }

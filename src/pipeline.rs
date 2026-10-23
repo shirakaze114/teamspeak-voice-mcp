@@ -5,7 +5,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use silero::{SampleRate, Session, SpeechOptions, SpeechSegmenter, SpeechSegmenterExt, StreamState};
+use silero::{
+    SampleRate, Session, SpeechOptions, SpeechSegmenter, SpeechSegmenterExt, StreamState,
+};
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -111,7 +113,8 @@ impl Pipeline {
 
     fn on_event(&mut self, ev: TrackEvent) {
         match ev {
-            TrackEvent::Start { speaker, .. } => {
+            TrackEvent::Start { speaker, at } => {
+                let _ = at;
                 let id = speaker.client_id;
                 let opts = self.opts.clone();
                 let u = self.users.entry(id).or_insert_with(|| UserState {
@@ -133,7 +136,8 @@ impl Pipeline {
                 }
                 self.feed(client_id, &samples);
             }
-            TrackEvent::End { client_id, .. } => {
+            TrackEvent::End { client_id, at } => {
+                let _ = at;
                 if let Some(u) = self.users.get_mut(&client_id) {
                     u.idle_since = Some(Instant::now());
                 }
@@ -156,10 +160,15 @@ impl Pipeline {
     }
 
     fn feed(&mut self, id: u16, samples: &[f32]) {
-        let Some(u) = self.users.get_mut(&id) else { return };
+        let Some(u) = self.users.get_mut(&id) else {
+            return;
+        };
         u.buf.extend_from_slice(samples);
         let mut segments = Vec::new();
-        match u.seg.push_samples(&mut self.session, &mut u.stream, samples) {
+        match u
+            .seg
+            .push_samples(&mut self.session, &mut u.stream, samples)
+        {
             Ok(Some(s)) => {
                 segments.push(s);
                 while let Ok(Some(s)) = u.seg.push_samples(&mut self.session, &mut u.stream, &[]) {
@@ -180,7 +189,9 @@ impl Pipeline {
         let mode = self.asr.active_mode();
         let min_speech = ms_to_samples(self.vad_cfg.min_speech_ms);
         let pad = ms_to_samples(self.vad_cfg.pad_ms);
-        let Some(u) = self.users.get_mut(&id) else { return };
+        let Some(u) = self.users.get_mut(&id) else {
+            return;
+        };
         let now = u.pushed();
         if u.seg.is_active() {
             let since = *u.active_since.get_or_insert(now);
@@ -188,13 +199,21 @@ impl Pipeline {
                 let utt_id = format!("utt_{}", uuid::Uuid::new_v4().simple());
                 let mut utt = Utterance {
                     id: utt_id.clone(),
-                    started_at: OffsetDateTime::now_utc() - time::Duration::milliseconds(((now - since) * 1000 / ASR_RATE as u64) as i64),
+                    started_at: OffsetDateTime::now_utc()
+                        - time::Duration::milliseconds(
+                            ((now - since) * 1000 / ASR_RATE as u64) as i64,
+                        ),
                     stream: None,
                     fed_until: since.saturating_sub(pad),
                 };
                 if mode == Some(AsrMode::Streaming) {
                     let store = self.store.clone();
-                    let partial = partial_template(&u.speaker, &utt_id, utt.started_at, &self.asr.state().streaming_model);
+                    let partial = partial_template(
+                        &u.speaker,
+                        &utt_id,
+                        utt.started_at,
+                        &self.asr.state().streaming_model,
+                    );
                     match self.asr.start_stream(move |text| {
                         let mut ev = partial.clone();
                         ev.text = text;
@@ -204,22 +223,31 @@ impl Pipeline {
                         Err(e) => warn!("cannot start streaming ASR: {e:#}"),
                     }
                 }
-                self.store.emit(LiveEvent::Speech { client_id: id, name: u.speaker.name.clone(), active: true });
+                self.store.emit(LiveEvent::Speech {
+                    client_id: id,
+                    name: u.speaker.name.clone(),
+                    active: true,
+                });
                 u.utt = Some(utt);
             }
         } else {
             u.active_since = None;
         }
         // Stream new audio to the live ASR task.
-        if let Some(utt) = &mut u.utt
-            && let Some(h) = &utt.stream
-        {
-            let start = utt.fed_until;
-            let chunk = u.slice(start, now).to_vec();
-            if !chunk.is_empty() {
-                let _ = h.audio.send(chunk);
+        let feed_range = u
+            .utt
+            .as_ref()
+            .and_then(|utt| utt.stream.as_ref().map(|_| utt.fed_until..now));
+        if let Some(range) = feed_range {
+            let chunk = u.slice(range.start, range.end).to_vec();
+            if let Some(utt) = &mut u.utt
+                && let Some(h) = &utt.stream
+            {
+                if !chunk.is_empty() {
+                    let _ = h.audio.send(chunk);
+                }
+                utt.fed_until = now;
             }
-            utt.fed_until = now;
         }
         // Keep only what a future segment may still need.
         // `active_since` lags the real onset by up to one VAD frame; keep a margin.
@@ -236,7 +264,9 @@ impl Pipeline {
     }
 
     fn finish_user(&mut self, id: u16) {
-        let Some(u) = self.users.get_mut(&id) else { return };
+        let Some(u) = self.users.get_mut(&id) else {
+            return;
+        };
         let mut segments = Vec::new();
         if let Ok(Some(s)) = u.seg.finish_stream(&mut self.session, &mut u.stream) {
             segments.push(s);
@@ -251,7 +281,11 @@ impl Pipeline {
             if let Some(utt) = u.utt.take() {
                 // VAD dropped the run (too short): close a live stream without a segment.
                 drop(utt.stream);
-                self.store.emit(LiveEvent::Speech { client_id: id, name: u.speaker.name.clone(), active: false });
+                self.store.emit(LiveEvent::Speech {
+                    client_id: id,
+                    name: u.speaker.name.clone(),
+                    active: false,
+                });
             }
             u.seg.reset();
             u.stream.reset();
@@ -264,7 +298,9 @@ impl Pipeline {
 
     fn on_segment(&mut self, id: u16, start: u64, end: u64) {
         let mode = self.asr.active_mode();
-        let Some(u) = self.users.get_mut(&id) else { return };
+        let Some(u) = self.users.get_mut(&id) else {
+            return;
+        };
         let pcm = u.slice(start, end).to_vec();
         let utt = u.utt.take();
         u.active_since = None;
@@ -287,10 +323,18 @@ impl Pipeline {
             ),
         };
         debug!(client_id = id, name = %speaker.name, duration_ms, "segment");
-        self.store.emit(LiveEvent::Speech { client_id: id, name: speaker.name.clone(), active: false });
+        self.store.emit(LiveEvent::Speech {
+            client_id: id,
+            name: speaker.name.clone(),
+            active: false,
+        });
 
         if self.recording.enabled {
-            let path = self.recording.dir.join(format!("{}_c{}.wav", started_at.unix_timestamp(), id));
+            let path = self.recording.dir.join(format!(
+                "{}_c{}.wav",
+                started_at.unix_timestamp_nanos() / 1_000_000,
+                id
+            ));
             let pcm = pcm.clone();
             tokio::task::spawn_blocking(move || audio::write_wav_mono(&path, &pcm, ASR_RATE));
         }
@@ -299,7 +343,11 @@ impl Pipeline {
         let store = self.store.clone();
         let context: Vec<String> = if self.context_messages > 0 {
             self.store
-                .query(&Query { limit: self.context_messages, channel_id: Some(speaker.channel_id), ..Default::default() })
+                .query(&Query {
+                    limit: self.context_messages,
+                    channel_id: Some(speaker.channel_id),
+                    ..Default::default()
+                })
                 .into_iter()
                 .map(|e| e.text)
                 .collect()
@@ -312,7 +360,9 @@ impl Pipeline {
                     // Dropping the sender finishes the task.
                     let StreamHandle { audio, result } = h;
                     drop(audio);
-                    result.await.unwrap_or_else(|_| Err(anyhow::anyhow!("stream task dropped")))
+                    result
+                        .await
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!("stream task dropped")))
                 }
                 (None, Some(_)) => asr.transcribe(&pcm, &context).await,
                 (None, None) => return,
@@ -344,14 +394,22 @@ impl Pipeline {
                 }
                 Err(e) => {
                     warn!(client_id = id, "ASR failed: {e:#}");
-                    store.emit(LiveEvent::Log { level: "warn".into(), message: format!("ASR: {e:#}") });
+                    store.emit(LiveEvent::Log {
+                        level: "warn".into(),
+                        message: format!("ASR: {e:#}"),
+                    });
                 }
             }
         });
     }
 }
 
-fn partial_template(s: &SpeakerInfo, utt_id: &str, started_at: OffsetDateTime, model: &str) -> TranscriptEvent {
+fn partial_template(
+    s: &SpeakerInfo,
+    utt_id: &str,
+    started_at: OffsetDateTime,
+    model: &str,
+) -> TranscriptEvent {
     TranscriptEvent {
         event_id: String::new(),
         seq: 0,
@@ -359,7 +417,12 @@ fn partial_template(s: &SpeakerInfo, utt_id: &str, started_at: OffsetDateTime, m
         utterance_id: utt_id.to_string(),
         channel_id: s.channel_id,
         channel_name: s.channel_name.clone(),
-        speaker: Speaker { client_id: s.client_id, name: s.name.clone(), uid: s.uid.clone(), database_id: s.database_id },
+        speaker: Speaker {
+            client_id: s.client_id,
+            name: s.name.clone(),
+            uid: s.uid.clone(),
+            database_id: s.database_id,
+        },
         text: String::new(),
         timestamp: rfc3339(started_at),
         end_timestamp: None,

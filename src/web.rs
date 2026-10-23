@@ -65,7 +65,10 @@ pub async fn serve(app: Arc<App>, cfg: ServerConfig, shutdown: CancellationToken
         .with_state(app);
 
     let listener = tokio::net::TcpListener::bind(&cfg.bind).await?;
-    info!("control panel http://{}/  ·  MCP endpoint http://{}/mcp", cfg.bind, cfg.bind);
+    info!(
+        "control panel http://{}/  ·  MCP endpoint http://{}/mcp",
+        cfg.bind, cfg.bind
+    );
     axum::serve(listener, router)
         .with_graceful_shutdown(async move { shutdown.cancelled().await })
         .await?;
@@ -74,12 +77,18 @@ pub async fn serve(app: Arc<App>, cfg: ServerConfig, shutdown: CancellationToken
 
 /// Bearer token from `Authorization`, or `?token=` (for EventSource, which cannot set headers).
 fn extract_token(headers: &HeaderMap, query: Option<&str>) -> Option<String> {
-    if let Some(v) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok())
-        && let Some(t) = v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer "))
+    if let Some(v) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        && let Some(t) = v
+            .strip_prefix("Bearer ")
+            .or_else(|| v.strip_prefix("bearer "))
     {
         return Some(t.trim().to_string());
     }
-    form_urlencoded::parse(query?.as_bytes()).find(|(k, _)| k == "token").map(|(_, v)| v.into_owned())
+    form_urlencoded::parse(query?.as_bytes())
+        .find(|(k, _)| k == "token")
+        .map(|(_, v)| v.into_owned())
 }
 
 async fn auth(State(app): State<Arc<App>>, mut req: Request, next: Next) -> Response {
@@ -104,12 +113,18 @@ fn need(c: &Caller, scope: Scope) -> Result<(), (StatusCode, Json<serde_json::Va
     if c.has(scope) {
         Ok(())
     } else {
-        Err((StatusCode::FORBIDDEN, Json(json!({"error": format!("token lacks '{scope:?}' scope")}))))
+        Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": format!("token lacks '{scope:?}' scope")})),
+        ))
     }
 }
 
 fn fail(e: anyhow::Error) -> (StatusCode, Json<serde_json::Value>) {
-    (StatusCode::BAD_REQUEST, Json(json!({"error": format!("{e:#}")})))
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error": format!("{e:#}")})),
+    )
 }
 
 async fn status(State(app): State<Arc<App>>, Extension(c): Extension<Caller>) -> ApiResult {
@@ -130,13 +145,17 @@ async fn transcripts(
     QueryParams(q): QueryParams<Query>,
 ) -> ApiResult {
     need(&c, Scope::Read)?;
-    Ok(Json(json!({"events": app.store.query(&q), "latest_seq": app.store.latest_seq()})).into_response())
+    Ok(
+        Json(json!({"events": app.store.query(&q), "latest_seq": app.store.latest_seq()}))
+            .into_response(),
+    )
 }
 
 async fn events(
     State(app): State<Arc<App>>,
     Extension(c): Extension<Caller>,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<serde_json::Value>)>
+{
     need(&c, Scope::Read)?;
     let stream = BroadcastStream::new(app.store.live.subscribe()).filter_map(|ev| {
         let ev = ev.ok()?;
@@ -152,7 +171,11 @@ struct SpeakBody {
     interrupt: bool,
 }
 
-async fn speak(State(app): State<Arc<App>>, Extension(c): Extension<Caller>, Json(b): Json<SpeakBody>) -> ApiResult {
+async fn speak(
+    State(app): State<Arc<App>>,
+    Extension(c): Extension<Caller>,
+    Json(b): Json<SpeakBody>,
+) -> ApiResult {
     need(&c, Scope::Speak)?;
     let n = app.tts.speak(&b.text, b.interrupt).map_err(fail)?;
     Ok(Json(json!({"queued": true, "sentences": n})).into_response())
@@ -169,7 +192,11 @@ struct MessageBody {
     text: String,
 }
 
-async fn message(State(app): State<Arc<App>>, Extension(c): Extension<Caller>, Json(b): Json<MessageBody>) -> ApiResult {
+async fn message(
+    State(app): State<Arc<App>>,
+    Extension(c): Extension<Caller>,
+    Json(b): Json<MessageBody>,
+) -> ApiResult {
     need(&c, Scope::Speak)?;
     if b.text.trim().is_empty() || b.text.len() > 1024 {
         return Err(fail(anyhow::anyhow!("text must be 1..=1024 bytes")));
@@ -186,7 +213,11 @@ struct AsrBody {
     clear_block: bool,
 }
 
-async fn set_asr(State(app): State<Arc<App>>, Extension(c): Extension<Caller>, Json(b): Json<AsrBody>) -> ApiResult {
+async fn set_asr(
+    State(app): State<Arc<App>>,
+    Extension(c): Extension<Caller>,
+    Json(b): Json<AsrBody>,
+) -> ApiResult {
     need(&c, Scope::Admin)?;
     app.asr.set(b.enabled, b.mode, b.clear_block);
     info!(by = %c.name, enabled = ?b.enabled, mode = ?b.mode, "ASR settings changed");

@@ -145,16 +145,19 @@ async function refreshUsers() {
 function fmtTime(t) { try { return new Date(t).toLocaleTimeString(); } catch { return ''; } }
 function addLine(ev) {
   const log = $('log');
-  const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 30;
+  const oldHeight = log.scrollHeight, oldTop = log.scrollTop;
   let el = partials.get(ev.utterance_id);
-  if (!el) { el = document.createElement('div'); log.appendChild(el); }
+  const isNew = !el;
+  if (!el) { el = document.createElement('div'); log.prepend(el); }
   el.className = 'tr' + (ev.type === 'transcript.partial' ? ' partial' : '');
   el.innerHTML = `<span class="time">${fmtTime(ev.timestamp)}</span><span class="who">${esc(ev.speaker.name)}</span>${esc(ev.text)}`;
   if (ev.type === 'transcript.partial') partials.set(ev.utterance_id, el); else partials.delete(ev.utterance_id);
-  if (atBottom) log.scrollTop = log.scrollHeight;
+  // Newest utterance is at the top. Keep the user's reading position when
+  // they have scrolled down through older events.
+  if (isNew && oldTop > 0) log.scrollTop = oldTop + (log.scrollHeight - oldHeight);
 }
 function addWarn(msg) {
-  const el = document.createElement('div'); el.className = 'tr warn'; el.textContent = msg; $('log').appendChild(el);
+  const el = document.createElement('div'); el.className = 'tr warn'; el.textContent = msg; $('log').prepend(el);
 }
 
 let es;

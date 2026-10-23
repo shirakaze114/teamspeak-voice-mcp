@@ -2,17 +2,102 @@
 # host, host:port, or TS3 server nickname
 address = "ts.example.com:9987"
 nickname = "VoiceBot"
-# Channel path, e.g. "Lobby" or "Parent/Child". Omit for the server default channel.
-channel = "Lobby"
+# Numeric channel id takes precedence over channel path. 458 is the current test channel 停尸房.
+channel_id = 458
+# channel = "Parent/Child"
 # Passwords can also come from env: TS_SERVER_PASSWORD / TS_CHANNEL_PASSWORD
 # server_password = ""
 # channel_password = ""
 identity_file = "data/identity.json"
 announcement = "[提示] 本频道的语音可能会被机器人转写并交由 AI 处理。"
+# Nicknames or unique ids whose audio is ignored, e.g. music bots.
+ignore_clients = []
 log_commands = false
 
-[recording]
-# Phase-1 debugging: dump each utterance as 16 kHz mono WAV per user
+[vad]
+threshold = 0.5
+# neg_threshold = 0.35       # default: threshold - 0.15
+min_speech_ms = 300           # discard clicks and short noise bursts
+silence_end_ms = 700          # shorter pauses stay in one utterance
+pad_ms = 200
+max_segment_s = 30
+suppress_while_bot_speaking = false
+
+[asr]
 enabled = true
+# http = qwen-audio-3.0-asr-flash (one request/utterance, cheaper)
+# streaming = qwen-audio-3.0-asr-flash-streaming (WebSocket, partial results)
+mode = "http"
+# api_key = "..."             # or use api_key_file / DASHSCOPE_API_KEY
+# api_key_file = "dashscope-key"  # local file containing only the key; keep it gitignored
+http_model = "qwen-audio-3.0-asr-flash"
+streaming_model = "qwen-audio-3.0-asr-flash-streaming"
+# Optional workspace-specific endpoints (replace {WorkspaceId}); the legacy
+# dashscope.aliyuncs.com endpoints used by default remain supported.
+# http_url = "https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
+# ws_url = "wss://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference"
+# Beijing free quota: keep the provider's "stop when free tier is exhausted" switch on.
+language_hints = ["zh"]
+# hotwords = { "TeamSpeak" = 3, "百炼" = 4 }
+context_messages = 0
+max_sentence_silence_ms = 2000
+request_timeout_s = 30
+
+[asr.budget]
+# Local hard limits, independent of the provider-side free-tier switch. 0 = unlimited.
+daily_limit_seconds = 3600
+total_limit_seconds = 0
+usage_file = "data/usage.json"
+
+[tts]
+# none = disabled; openai = existing OpenAI-compatible POST {base_url}/audio/speech;
+# local = run an executable without a shell. Arguments support {text} and {output}.
+kind = "none"
+# macOS local example:
+# kind = "local"
+# command = "say"
+# args = ["-v", "Tingting", "-o", "{output}", "--file-format=WAVE", "--data-format=LEI16@22050", "{text}"]
+# Linux espeak-ng example (WAV written to {output}):
+# command = "espeak-ng"
+# args = ["-v", "zh", "-w", "{output}", "{text}"]
+base_url = "http://127.0.0.1:8880/v1"
+# api_key = "..."             # or TTS_API_KEY
+model = "tts-1"
+voice = "alloy"
+# wav = decode with symphonia; pcm = raw s16le mono at sample_rate
+format = "wav"
+sample_rate = 24000
+# speed = 1.0
+max_chars = 500
+volume = 1.0
+request_timeout_s = 60
+
+[server]
+bind = "127.0.0.1:8787"
+# Add public hostnames here when exposing the MCP endpoint through a reverse proxy.
+allowed_hosts = []
+# Keep authentication enabled. For local-only experiments, set bind to loopback and
+# auth_disabled = true instead of adding tokens.
+auth_disabled = false
+
+[[server.tokens]]
+name = "local-admin"
+token = "replace-with-a-long-random-token"
+scopes = ["admin"]
+
+# Additional read-only or speak-only tokens can be added:
+# [[server.tokens]]
+# name = "agent"
+# token = "another-long-random-token"
+# scopes = ["read", "speak"]
+
+[transcripts]
+retention_hours = 24
+max_events = 5000
+persist = false
+file = "data/transcripts.jsonl"
+
+[recording]
+# Save VAD segments as 16 kHz mono WAV for debugging (off by default).
+enabled = false
 dir = "data/recordings"
-min_utterance_ms = 300

@@ -27,12 +27,23 @@ pub fn decode_mono(bytes: Vec<u8>) -> Result<(Vec<f32>, u32)> {
 
     let mss = MediaSourceStream::new(Box::new(std::io::Cursor::new(bytes)), Default::default());
     let mut format = symphonia::default::get_probe()
-        .probe(&Hint::new(), mss, FormatOptions::default(), MetadataOptions::default())
+        .probe(
+            &Hint::new(),
+            mss,
+            FormatOptions::default(),
+            MetadataOptions::default(),
+        )
         .context("unrecognised audio format")?;
-    let track = format.default_track(TrackType::Audio).context("no audio track")?;
-    let params = track.codec_params.as_ref().and_then(|p| p.audio()).context("no audio params")?;
-    let mut decoder =
-        symphonia::default::get_codecs().make_audio_decoder(params, &AudioDecoderOptions::default())?;
+    let track = format
+        .default_track(TrackType::Audio)
+        .context("no audio track")?;
+    let params = track
+        .codec_params
+        .as_ref()
+        .and_then(|p| p.audio())
+        .context("no audio params")?;
+    let mut decoder = symphonia::default::get_codecs()
+        .make_audio_decoder(params, &AudioDecoderOptions::default())?;
     let track_id = track.id;
     let mut mono = Vec::new();
     let mut rate = 0;
@@ -50,7 +61,10 @@ pub fn decode_mono(bytes: Vec<u8>) -> Result<(Vec<f32>, u32)> {
         let ch = decoded.spec().channels().count().max(1);
         buf.resize(decoded.samples_interleaved(), 0.0);
         decoded.copy_to_slice_interleaved(&mut buf);
-        mono.extend(buf.chunks_exact(ch).map(|c| c.iter().sum::<f32>() / ch as f32));
+        mono.extend(
+            buf.chunks_exact(ch)
+                .map(|c| c.iter().sum::<f32>() / ch as f32),
+        );
     }
     if rate == 0 {
         bail!("audio contained no samples");
@@ -67,12 +81,19 @@ pub fn load_for_playback(path: &Path) -> Result<Vec<f32>> {
 
 /// Little-endian s16 PCM bytes.
 pub fn to_s16le(pcm: &[f32]) -> Vec<u8> {
-    pcm.iter().flat_map(|s| ((s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16).to_le_bytes()).collect()
+    pcm.iter()
+        .flat_map(|s| ((s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16).to_le_bytes())
+        .collect()
 }
 
 /// s16le bytes to f32.
 pub fn from_s16le(bytes: &[u8]) -> Vec<f32> {
-    bytes.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0).collect()
+    bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+        .collect()
 }
 
 /// Encode mono PCM as an in-memory 16-bit WAV.
@@ -110,7 +131,11 @@ impl Downsampler {
             FixedSync::Input,
         )?;
         let out_len = rs.output_frames_max();
-        Ok(Self { rs, pending: Vec::with_capacity(TS_FRAME * 2), out_buf: vec![0.0; out_len] })
+        Ok(Self {
+            rs,
+            pending: Vec::with_capacity(TS_FRAME * 2),
+            out_buf: vec![0.0; out_len],
+        })
     }
 
     /// Push 48 kHz samples, append resampled 16 kHz samples to `out`.
@@ -158,13 +183,19 @@ impl OpusFramer {
     pub fn new() -> Result<Self> {
         let mut enc = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip)?;
         enc.set_bitrate(Bitrate::BitsPerSecond(48_000))?;
-        Ok(Self { enc, pending: Vec::new(), out: [0; MAX_OPUS_PACKET] })
+        Ok(Self {
+            enc,
+            pending: Vec::new(),
+            out: [0; MAX_OPUS_PACKET],
+        })
     }
 
     pub fn push(&mut self, pcm: &[f32], mut sink: impl FnMut(Vec<u8>) -> Result<()>) -> Result<()> {
         self.pending.extend_from_slice(pcm);
         while self.pending.len() >= TS_FRAME {
-            let n = self.enc.encode_float(&self.pending[..TS_FRAME], &mut self.out)?;
+            let n = self
+                .enc
+                .encode_float(&self.pending[..TS_FRAME], &mut self.out)?;
             sink(self.out[..n].to_vec())?;
             self.pending.drain(..TS_FRAME);
         }
@@ -182,11 +213,20 @@ impl OpusFramer {
 
 /// Write mono f32 PCM as a 16-bit WAV file.
 pub fn write_wav_mono(path: &Path, pcm: &[f32], rate: u32) -> Result<()> {
-    write_wav(std::io::BufWriter::new(std::fs::File::create(path)?), pcm, rate)
+    write_wav(
+        std::io::BufWriter::new(std::fs::File::create(path)?),
+        pcm,
+        rate,
+    )
 }
 
 fn write_wav<W: std::io::Write + std::io::Seek>(w: W, pcm: &[f32], rate: u32) -> Result<()> {
-    let spec = hound::WavSpec { channels: 1, sample_rate: rate, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
     let mut w = hound::WavWriter::new(w, spec)?;
     for &s in pcm {
         w.write_sample((s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)?;
@@ -200,47 +240,53 @@ mod tests {
     use super::*;
 
     #[test]
-    fn downsampler_length() {
-        let mut d = Downsampler::new().unwrap();
+    fn downsampler_length() -> Result<()> {
+        let mut d = Downsampler::new()?;
         let mut out = Vec::new();
         let input: Vec<f32> = (0..48_000).map(|i| (i as f32 * 0.01).sin() * 0.5).collect();
         for chunk in input.chunks(700) {
-            d.push(chunk, &mut out).unwrap();
+            d.push(chunk, &mut out)?;
         }
-        d.flush(&mut out).unwrap();
-        assert!((out.len() as i64 - 16_000).abs() <= 320, "got {}", out.len());
+        d.flush(&mut out)?;
+        assert!(
+            (out.len() as i64 - 16_000).abs() <= 320,
+            "got {}",
+            out.len()
+        );
+        Ok(())
     }
 
     #[test]
-    fn opus_framer_frames() {
-        let mut f = OpusFramer::new().unwrap();
+    fn opus_framer_frames() -> Result<()> {
+        let mut f = OpusFramer::new()?;
         let mut frames = 0;
         let pcm = vec![0.1f32; TS_FRAME * 3 + 10];
         f.push(&pcm, |_| {
             frames += 1;
             Ok(())
-        })
-        .unwrap();
+        })?;
         f.finish(|_| {
             frames += 1;
             Ok(())
-        })
-        .unwrap();
+        })?;
         assert_eq!(frames, 4);
+        Ok(())
     }
 
     #[test]
-    fn wav_roundtrip_via_symphonia() {
+    fn wav_roundtrip_via_symphonia() -> Result<()> {
         let pcm: Vec<f32> = (0..16_000).map(|i| (i as f32 * 0.05).sin() * 0.3).collect();
-        let (mono, rate) = decode_mono(wav_bytes(&pcm, 16_000).unwrap()).unwrap();
+        let (mono, rate) = decode_mono(wav_bytes(&pcm, 16_000)?)?;
         assert_eq!(rate, 16_000);
         assert_eq!(mono.len(), pcm.len());
+        Ok(())
     }
 
     #[test]
-    fn resample_clip_ratio() {
+    fn resample_clip_ratio() -> Result<()> {
         let input = vec![0.0f32; 22_050];
-        let out = resample_clip(&input, 22_050, 48_000).unwrap();
+        let out = resample_clip(&input, 22_050, 48_000)?;
         assert!((out.len() as i64 - 48_000).abs() <= 64, "got {}", out.len());
+        Ok(())
     }
 }
