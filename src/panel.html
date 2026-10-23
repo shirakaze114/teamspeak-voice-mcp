@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TS Voice MCP</title>
+<style>
+  :root { --bg:#111418; --card:#1b2027; --fg:#e6e8eb; --mute:#8b949e; --ok:#3fb950; --bad:#f85149; --acc:#58a6ff; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.5 system-ui, -apple-system, "PingFang SC", sans-serif; background:var(--bg); color:var(--fg); }
+  header { padding:12px 20px; display:flex; gap:16px; align-items:center; border-bottom:1px solid #2a313a; }
+  header h1 { font-size:16px; margin:0; }
+  main { display:grid; grid-template-columns: 320px 1fr; gap:16px; padding:16px 20px; }
+  .card { background:var(--card); border-radius:8px; padding:12px 14px; margin-bottom:16px; }
+  .card h2 { font-size:13px; text-transform:uppercase; color:var(--mute); margin:0 0 8px; letter-spacing:.04em; }
+  .kv { display:grid; grid-template-columns:auto 1fr; gap:2px 10px; }
+  .kv span:nth-child(odd) { color:var(--mute); }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; background:var(--bad); }
+  .dot.on { background:var(--ok); }
+  ul { list-style:none; padding:0; margin:0; }
+  li.user { padding:3px 0; }
+  li.user.talk { color:var(--ok); font-weight:600; }
+  #log { height: calc(100vh - 260px); overflow-y:auto; }
+  .tr { padding:6px 0; border-bottom:1px solid #262c34; }
+  .tr .who { color:var(--acc); font-weight:600; margin-right:8px; }
+  .tr .time { color:var(--mute); font-size:12px; margin-right:8px; }
+  .tr.partial { opacity:.6; font-style:italic; }
+  .tr.warn { color:var(--bad); }
+  input, textarea, select, button { font:inherit; color:var(--fg); background:#0d1117; border:1px solid #30363d; border-radius:6px; padding:6px 8px; }
+  textarea { width:100%; resize:vertical; }
+  button { cursor:pointer; background:#238636; border-color:#2ea043; }
+  button.sec { background:#21262d; border-color:#30363d; }
+  button.danger { background:#da3633; border-color:#f85149; }
+  .row { display:flex; gap:8px; align-items:center; margin-top:8px; flex-wrap:wrap; }
+  .err { color:var(--bad); }
+  #login { max-width:420px; margin:80px auto; }
+  .bar { height:6px; background:#30363d; border-radius:3px; overflow:hidden; margin-top:4px; }
+  .bar div { height:100%; background:var(--acc); }
+  code { color:var(--mute); }
+</style>
+</head>
+<body>
+<div id="login" class="card" hidden>
+  <h2>API Token</h2>
+  <input id="tok" type="password" placeholder="Bearer token" style="width:100%">
+  <div class="row"><button onclick="saveToken()">进入</button><span id="loginErr" class="err"></span></div>
+</div>
+
+<div id="ui" hidden>
+<header>
+  <h1>TS Voice MCP</h1>
+  <span><span id="connDot" class="dot"></span><span id="connText">-</span></span>
+  <span style="flex:1"></span>
+  <code id="who"></code>
+  <button class="sec" onclick="logout()">退出</button>
+</header>
+<main>
+  <div>
+    <div class="card"><h2>Bot</h2><div class="kv" id="bot"></div></div>
+    <div class="card"><h2>频道成员</h2><ul id="users"></ul></div>
+    <div class="card">
+      <h2>ASR</h2>
+      <div class="kv" id="asr"></div>
+      <div class="row admin">
+        <label><input type="checkbox" id="asrEnabled" onchange="setAsr({enabled:this.checked})"> 启用</label>
+        <select id="asrMode" onchange="setAsr({mode:this.value})">
+          <option value="http">非实时 (flash, 便宜)</option>
+          <option value="streaming">实时 (streaming)</option>
+        </select>
+        <button class="sec" id="unblock" onclick="setAsr({clear_block:true})" hidden>解除封锁</button>
+      </div>
+    </div>
+    <div class="card"><h2>用量</h2><div class="kv" id="usage"></div><div class="bar"><div id="usageBar" style="width:0"></div></div></div>
+  </div>
+  <div>
+    <div class="card speak">
+      <h2>发言</h2>
+      <textarea id="say" rows="2" placeholder="让 Bot 说话（TTS）或发文字消息"></textarea>
+      <div class="row">
+        <button onclick="speak()">说话</button>
+        <label><input type="checkbox" id="interrupt"> 打断当前</label>
+        <button class="danger" onclick="post('/api/stop',{})">停止播放</button>
+        <button class="sec" onclick="sendMsg()">发文字</button>
+        <span id="speakErr" class="err"></span>
+      </div>
+    </div>
+    <div class="card">
+      <h2>实时转写</h2>
+      <div id="log"></div>
+    </div>
+    <div class="card"><h2>MCP</h2>
+      <div>Endpoint: <code id="mcpUrl"></code> · Header: <code>Authorization: Bearer &lt;token&gt;</code></div>
+      <div>Resources: <code>ts://transcripts/latest</code> <code>ts://users</code> <code>ts://status</code> <code>ts://transcripts/{event_id}</code></div>
+    </div>
+  </div>
+</main>
+</div>
+
+<script>
+let token = localStorage.getItem('tsv_token') || '';
+let scopes = [];
+const partials = new Map();
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const kv = (el, obj) => { el.innerHTML = Object.entries(obj).map(([k,v]) => `<span>${esc(k)}</span><span>${esc(v)}</span>`).join(''); };
+
+async function api(path, opts = {}) {
+  const r = await fetch(path, { ...opts, headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json', ...(opts.headers||{}) } });
+  if (r.status === 401) { showLogin('token 无效'); throw new Error('unauthorized'); }
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+const post = (p, b) => api(p, { method: 'POST', body: JSON.stringify(b) });
+
+function showLogin(err) { $('ui').hidden = true; $('login').hidden = false; $('loginErr').textContent = err || ''; }
+function saveToken() { token = $('tok').value.trim(); localStorage.setItem('tsv_token', token); start(); }
+function logout() { localStorage.removeItem('tsv_token'); token = ''; showLogin(); }
+
+async function refresh() {
+  const s = await api('/api/status');
+  scopes = s.caller.scopes;
+  $('who').textContent = `${s.caller.name} [${scopes.join(',')}]`;
+  const b = s.bot || {};
+  $('connDot').className = 'dot' + (b.connected ? ' on' : '');
+  $('connText').textContent = b.connected ? `已连接 · ${b.channel_name || ''}` : '未连接';
+  kv($('bot'), { 'client id': b.own_client_id ?? '-', '频道': `${b.channel_name ?? '-'} (${b.channel_id ?? '-'})`, '播放中': b.playing ? `是 (${b.queued_ms} ms 排队)` : '否', '正在说话': b.active_speakers ?? 0, 'TTS': s.tts_available ? '可用' : '未配置', '运行': `${Math.floor(s.uptime_s/60)} 分钟` });
+  const a = s.asr;
+  kv($('asr'), { '状态': a.blocked ? '已封锁: ' + a.blocked : (a.enabled ? (a.has_api_key ? '运行' : '缺 API Key') : '已关闭'), '模式': a.mode === 'http' ? a.http_model : a.streaming_model });
+  $('asrEnabled').checked = a.enabled; $('asrMode').value = a.mode; $('unblock').hidden = !a.blocked;
+  const u = s.usage;
+  kv($('usage'), { '今日': `${u.today_seconds.toFixed(0)} s` + (u.daily_limit_seconds ? ` / ${u.daily_limit_seconds} s` : ''), '累计': `${u.total_seconds.toFixed(0)} s (${(u.total_seconds/60).toFixed(1)} 分钟)`, '估算原价': `¥${u.estimated_cost_cny.toFixed(4)}`, '请求/失败': `${u.requests} / ${u.failures}` });
+  $('usageBar').style.width = u.daily_limit_seconds ? Math.min(100, 100 * u.today_seconds / u.daily_limit_seconds) + '%' : '0';
+  const isAdmin = scopes.includes('admin'), canSpeak = isAdmin || scopes.includes('speak');
+  document.querySelectorAll('.admin').forEach(e => e.hidden = !isAdmin);
+  document.querySelectorAll('.speak').forEach(e => e.hidden = !canSpeak);
+}
+
+const talking = new Set();
+async function refreshUsers() {
+  const users = await api('/api/users').catch(() => []);
+  $('users').innerHTML = users.map(u => `<li class="user ${talking.has(u.client_id) ? 'talk' : ''}">${u.talking || talking.has(u.client_id) ? '🎙 ' : ''}${esc(u.name)} <code>#${u.client_id}</code>${u.is_self ? ' (bot)' : ''}</li>`).join('');
+}
+
+function fmtTime(t) { try { return new Date(t).toLocaleTimeString(); } catch { return ''; } }
+function addLine(ev) {
+  const log = $('log');
+  const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 30;
+  let el = partials.get(ev.utterance_id);
+  if (!el) { el = document.createElement('div'); log.appendChild(el); }
+  el.className = 'tr' + (ev.type === 'transcript.partial' ? ' partial' : '');
+  el.innerHTML = `<span class="time">${fmtTime(ev.timestamp)}</span><span class="who">${esc(ev.speaker.name)}</span>${esc(ev.text)}`;
+  if (ev.type === 'transcript.partial') partials.set(ev.utterance_id, el); else partials.delete(ev.utterance_id);
+  if (atBottom) log.scrollTop = log.scrollHeight;
+}
+function addWarn(msg) {
+  const el = document.createElement('div'); el.className = 'tr warn'; el.textContent = msg; $('log').appendChild(el);
+}
+
+let es;
+function connectEvents() {
+  if (es) es.close();
+  es = new EventSource('/api/events?token=' + encodeURIComponent(token));
+  es.onmessage = m => {
+    const ev = JSON.parse(m.data);
+    if (ev.kind === 'transcript') { addLine(ev); if (ev.type === 'transcript.final') refresh(); }
+    else if (ev.kind === 'speech') { ev.active ? talking.add(ev.client_id) : talking.delete(ev.client_id); refreshUsers(); }
+    else if (ev.kind === 'users_changed') refreshUsers();
+    else if (ev.kind === 'log') addWarn(ev.message);
+  };
+}
+
+async function speak() {
+  $('speakErr').textContent = '';
+  try { await post('/api/speak', { text: $('say').value, interrupt: $('interrupt').checked }); $('say').value = ''; }
+  catch (e) { $('speakErr').textContent = e.message; }
+}
+async function sendMsg() {
+  $('speakErr').textContent = '';
+  try { await post('/api/message', { text: $('say').value }); $('say').value = ''; }
+  catch (e) { $('speakErr').textContent = e.message; }
+}
+async function setAsr(b) { try { await post('/api/asr', b); } finally { refresh(); } }
+
+async function start() {
+  try { await refresh(); } catch (e) { if (e.message !== 'unauthorized') showLogin(e.message); return; }
+  $('login').hidden = true; $('ui').hidden = false;
+  $('mcpUrl').textContent = location.origin + '/mcp';
+  const t = await api('/api/transcripts?limit=100');
+  $('log').innerHTML = ''; t.events.forEach(addLine);
+  refreshUsers(); connectEvents();
+}
+setInterval(() => { if (token && !$('ui').hidden) { refresh().catch(() => {}); refreshUsers(); } }, 5000);
+token ? start() : showLogin();
+$('say').addEventListener('keydown', e => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) speak(); });
+</script>
+</body>
+</html>

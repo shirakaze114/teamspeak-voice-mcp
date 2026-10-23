@@ -1,0 +1,18 @@
+[teamspeak]
+# host, host:port, or TS3 server nickname
+address = "ts.example.com:9987"
+nickname = "VoiceBot"
+# Channel path, e.g. "Lobby" or "Parent/Child". Omit for the server default channel.
+channel = "Lobby"
+# Passwords can also come from env: TS_SERVER_PASSWORD / TS_CHANNEL_PASSWORD
+# server_password = ""
+# channel_password = ""
+identity_file = "data/identity.json"
+announcement = "[提示] 本频道的语音可能会被机器人转写并交由 AI 处理。"
+log_commands = false
+
+[recording]
+# Phase-1 debugging: dump each utterance as 16 kHz mono WAV per user
+enabled = true
+dir = "data/recordings"
+min_utterance_ms = 300
